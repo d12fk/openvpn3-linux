@@ -2,6 +2,7 @@
 //
 //  Copyright (C) 2017      OpenVPN Inc. <sales@openvpn.net>
 //  Copyright (C) 2017      David Sommerseth <davids@openvpn.net>
+//  Copyright (C) 2022      Heiko Hund <heiko@openvpn.net>
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU Affero General Public License as
@@ -26,7 +27,7 @@
  */
 
 #include <iostream>
-#include <gio/gio.h>
+#include <dbus.h>
 
 int main(int argc, char **argv)
 {
@@ -35,85 +36,102 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    GError *error = NULL;
-    GDBusConnection *conn = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
-    if (!conn || error)
+    DBus::asio::io_context ioc;
+    auto dbus = DBus::Connection::create(ioc);
+    if (!dbus)
     {
-        std::cout << "** ERROR ** g_bus_get_sync(): " << error->message << std::endl;
+        std::cout << "** ERROR ** DBus::Connection::create()" << std::endl;
         return 2;
     }
 
-    error = NULL;
-    GDBusProxy *p = g_dbus_proxy_new_sync(conn,
-                                          G_DBUS_PROXY_FLAGS_NONE,
-                                          NULL,                            // GDBusInterfaceInfo
-                                          "net.openvpn.v3.configuration",  // name
-                                          argv[1],                         // object path
-                                          "net.openvpn.v3.configuration",  // interface name
-                                          NULL,                            // GCancellable
-                                          &error);
-    if (!p || error)
+    dbus->connect(
+        DBus::Platform::getSystemBus(),
+        DBus::AuthenticationProtocol::create(),
+        [dbus, argv]
+        (const DBus::Error& error, const std::string&, const std::string&)
+        {
+            if (error)
+                throw std::runtime_error("** ERROR ** connect(): " + error.message + " (" + error.category + ")");
+
+            dbus->getAllProperties(
+                "net.openvpn.v3.configuration", // bus name
+                argv[1],                        // object path
+                "net.openvpn.v3.configuration", // interface name
+                [dbus, argv]
+                (const DBus::Error& error, const DBus::Message::MethodReturn& reply)
+                {
+                    if (error)
+                        throw std::runtime_error("** ERROR ** getAllProperties(): " + error.message + " (" + error.category + ")");
+
+                    struct {
+                        bool valid;
+                        bool readonly;
+                        bool persistent;
+                        bool single_use;
+                        std::string name;
+                    } props;
+
+                    // reply contains an "ARRAY of DICT_ENTRY<STRING,VARIANT>"
+                    for (const auto& elem : DBus::Type::refArray(reply.getParameter(0)))
+                    {
+                        const DBus::Type::DictEntry& dict_entry = DBus::Type::refDictEntry(elem);
+                        auto key = DBus::Type::asString(dict_entry.key());
+                        auto value = dict_entry.value();
+
+                        if (key == "name")
+                            props.name = DBus::Type::asString(value);
+                        else if (key == "readonly")
+                            props.readonly = DBus::Type::asBoolean(value);
+                        else if (key == "persistent")
+                            props.persistent = DBus::Type::asBoolean(value);
+                        else if (key == "single_use")
+                            props.single_use = DBus::Type::asBoolean(value);
+                        else if (key == "valid")
+                        {
+                            props.valid = DBus::Type::asBoolean(value);
+                            if (false == props.valid)
+                                throw std::runtime_error("** ERROR ** Configuration is not valid");
+                        }
+                    }
+
+                    dbus->sendMethodCall(
+                      { "net.openvpn.v3.configuration",       // bus name
+                        {
+                          static_cast<const char *>(argv[1]), // object path
+                          "net.openvpn.v3.configuration",     // interface name
+                          "Fetch" } },                        // member name
+                      [dbus, props]
+                      (const DBus::Error& error, const DBus::Message::MethodReturn& reply)
+                      {
+                          if (error)
+                              throw std::runtime_error( "** ERROR ** g_dbus_proxy_call_sync(): " + error.message + " (" + error.category + ")");
+
+                          auto content = DBus::Type::asString(reply.getParameter(0));
+
+                          std::cout << "Configuration:" << std::endl;
+                          std::cout << "  - Name:       " << props.name << std::endl;
+                          std::cout << "  - Read only:  " << (props.readonly ? "Yes" : "No") << std::endl;
+                          std::cout << "  - Persistent: " << (props.persistent ? "Yes" : "No") << std::endl;
+                          std::cout << "  - Usage:      " << (props.single_use ? "Once" : "Multiple times") << std::endl;
+                          std::cout << "--------------------------------------------------" << std::endl;
+                          std::cout << content << std::endl;
+                          std::cout << "--------------------------------------------------" << std::endl;
+
+                          dbus->disconnect();
+                      });
+                });
+        });
+
+    try
     {
-        std::cout << "** ERROR ** g_dbus_proxy_new_sync(): " << error->message << std::endl;
+        ioc.run();
+    }
+    catch (const std::runtime_error& error)
+    {
+        std::cout << error.what() << std::endl;
+        dbus->disconnect();
         return 2;
     }
 
-    GVariant *res_v = g_dbus_proxy_get_cached_property (p, "valid");
-    gboolean valid = g_variant_get_boolean(res_v);
-    if (false == valid)
-    {
-        std::cout << "** ERROR ** Configuration is not valid" << std::endl;
-        return 3;
-    }
-    g_variant_unref(res_v);
-
-    res_v = g_dbus_proxy_get_cached_property (p, "readonly");
-    gboolean readonly = g_variant_get_boolean(res_v);
-    g_variant_unref(res_v);
-
-    res_v = g_dbus_proxy_get_cached_property (p, "persistent");
-    gboolean persistent = g_variant_get_boolean(res_v);
-    g_variant_unref(res_v);
-
-    res_v = g_dbus_proxy_get_cached_property (p, "single_use");
-    gboolean single_use = g_variant_get_boolean(res_v);
-    g_variant_unref(res_v);
-
-    res_v = g_dbus_proxy_get_cached_property (p, "name");
-    gsize cfgnamelen = 0;
-    const gchar *cfgname = g_variant_get_string(res_v, &cfgnamelen);
-    g_variant_unref(res_v);
-
-    error = NULL;
-    res_v = g_dbus_proxy_call_sync(p,
-                                   "Fetch",                // method
-                                   NULL,                   // parameters to method
-                                   G_DBUS_CALL_FLAGS_NONE,
-                                   -1,                     // timeout, -1 == default
-                                   NULL,                   // GCancellable
-                                   &error);
-    if (!res_v || error)
-    {
-        std::cout << "** ERROR ** g_dbus_proxy_call_sync(): " << error->message << std::endl;
-        return 2;
-    }
-    gchar *conf_s = nullptr;
-    g_variant_get(res_v, "(s)", &conf_s);
-    std::string config(conf_s);
-    g_variant_unref(res_v);
-    g_free(conf_s);
-
-    std::cout << "Configuration: " << std::endl;
-    std::cout << "  - Name:       " << cfgname << std::endl;
-    std::cout << "  - Read only:  " << (readonly ? "Yes" : "No") << std::endl;
-    std::cout << "  - Persistent: " << (persistent ? "Yes" : "No") << std::endl;
-    std::cout << "  - Usage:      " << (single_use ? "Once" : "Multiple times") << std::endl;
-    std::cout << "--------------------------------------------------" << std::endl;
-    std::cout << config << std::endl;
-    std::cout << "--------------------------------------------------" << std::endl;
-
-    // Clean-up and disconnect
-    g_object_unref(p);
-    g_object_unref(conn);
     std::cout << "** DONE" << std::endl;
 }

@@ -97,6 +97,13 @@ PKG_CHECK_MODULES(
         [AC_MSG_ERROR([glib2/gio-unix package not found. Is the glib2 development package installed?])]
 )
 
+PKG_CHECK_MODULES(
+        [LIBDBUSASIO],
+        [dbus-asio],
+        [have_dbusasio="yes"],
+        [AC_MSG_ERROR([dbus-asio package not found. Is the dbus-asio package installed?])]
+)
+
 dnl
 dnl  Check for UUID library
 dnl
